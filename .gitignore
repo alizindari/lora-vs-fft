@@ -1,0 +1,6 @@
+.venv/
+saves/
+__pycache__/
+*.pyc
+*.out
+.claude/

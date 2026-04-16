@@ -1,21 +1,38 @@
 [project]
 name = "lora-vs-fft"
 version = "0.1.0"
-requires-python = ">=3.12"
+description = "LoRA vs Full Fine-Tuning experiments on Qwen 2.5"
+requires-python = ">=3.10,<3.14"
 dependencies = [
-    "torch>=2.4.0",
-    "transformers>=4.49.0",
-    "datasets>=2.16.0",
-    "peft>=0.14.0",
-    "deepspeed>=0.15.0",
-    "accelerate>=1.3.0",
+    "torch>=2.2.0",
+    "transformers>=4.44.0",
+    "peft>=0.12.0,<0.19.0",
+    "datasets>=2.20.0",
+    "accelerate>=0.33.0",
+    "deepspeed>=0.14.0",
+    "lm-eval>=0.4.0",
     "safetensors",
     "numpy",
-    "scipy",
     "matplotlib",
-    "lm-eval>=0.4.0",
+    "scipy",
+    "scikit-learn",
 ]
+
+[project.optional-dependencies]
+flash = ["flash-attn>=2.5.0"]
+wandb = ["wandb"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
