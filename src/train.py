@@ -54,16 +54,85 @@ GLUE_TASKS = {
 # Pipeline 1: Qwen causal LM on commonsense_170k
 # ---------------------------------------------------------------------------
 
-def tokenize_with_mask(example, tokenizer, max_length):
-    """Tokenize instruction + output, mask instruction tokens in labels."""
-    instruction = example["instruction"].strip()
-    output = example["output"].strip()
+def _parse_boolq_input(alpaca_input):
+    """Extract (passage, question) from BoolQ alpaca `input` field.
 
-    prompt_ids = tokenizer(instruction + "\n", add_special_tokens=False)["input_ids"]
-    answer_ids = tokenizer(output + tokenizer.eos_token, add_special_tokens=False)["input_ids"]
+    Expected format: 'Passage: <passage>\\n\\nQuestion: <question>'.
+    Returns the passage without the 'Passage: ' prefix and the question
+    without a trailing '?' (we add '?' in the template).
+    """
+    parts = alpaca_input.split("\n\nQuestion:", 1)
+    passage = parts[0].strip()
+    if passage.startswith("Passage:"):
+        passage = passage[len("Passage:"):].strip()
+    question = parts[1].strip() if len(parts) > 1 else ""
+    if question.endswith("?"):
+        question = question[:-1]
+    return passage, question
 
-    input_ids = prompt_ids + answer_ids
-    labels = [IGNORE_INDEX] * len(prompt_ids) + answer_ids
+
+def _parse_csqa_input(alpaca_input):
+    """Extract (question, options_block) from CommonsenseQA alpaca `input`.
+
+    Expected format:
+        'Question: <q>\\n\\nOptions:\\nA. <a>\\nB. <b>\\nC. <c>\\nD. <d>\\nE. <e>'
+    Returns the raw question text (prefix stripped) and the options block
+    as a single newline-joined string 'A. <a>\\nB. <b>\\n...'.
+    """
+    parts = alpaca_input.split("\n\nOptions:", 1)
+    question = parts[0].strip()
+    if question.startswith("Question:"):
+        question = question[len("Question:"):].strip()
+    options = parts[1].strip() if len(parts) > 1 else ""
+    return question, options
+
+
+def format_example(example, dataset_name):
+    """Format an alpaca-style example into (prompt, target).
+
+    For BoolQ and CommonsenseQA we match the lm-evaluation-harness
+    prompt/target format exactly, so the training signal lives at the
+    same (context, token) pair that lm-eval queries: prompt ends in
+    'Answer:', target is the space-prefixed class token.
+
+    For other datasets we use the standard alpaca concatenation
+    (instruction [+ input] -> output), which at minimum ensures the
+    `input` field is not dropped (the previous code discarded it).
+    """
+    dn = dataset_name.lower()
+    instruction = (example.get("instruction") or "").strip()
+    alpaca_input = (example.get("input") or "").strip()
+    output = (example.get("output") or "").strip()
+
+    if "boolq" in dn:
+        passage, question = _parse_boolq_input(alpaca_input)
+        prompt = f"{passage}\nQuestion: {question}?\nAnswer:"
+        target = " yes" if output.lower().startswith("y") else " no"
+        return prompt, target
+
+    if "commonsense_qa" in dn:
+        question, options = _parse_csqa_input(alpaca_input)
+        prompt = f"Question: {question}\n{options}\nAnswer:"
+        target = f" {output.strip().upper()}"
+        return prompt, target
+
+    # Standard alpaca fallback (instruction + optional input -> output).
+    if alpaca_input:
+        prompt = f"{instruction}\n\n{alpaca_input}\n\n"
+    else:
+        prompt = f"{instruction}\n"
+    return prompt, output
+
+
+def tokenize_with_mask(example, tokenizer, max_length, dataset_name):
+    """Format, tokenize, and mask prompt tokens so loss is only on target tokens."""
+    prompt, target = format_example(example, dataset_name)
+
+    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    target_ids = tokenizer(target + tokenizer.eos_token, add_special_tokens=False)["input_ids"]
+
+    input_ids = prompt_ids + target_ids
+    labels = [IGNORE_INDEX] * len(prompt_ids) + target_ids
 
     if len(input_ids) > max_length:
         input_ids = input_ids[:max_length]
@@ -77,17 +146,19 @@ def tokenize_with_mask(example, tokenizer, max_length):
 
 
 def load_commonsense_data(data_path, tokenizer, max_length, max_samples, val_size, seed):
-    """Load commonsense_170k JSON, tokenize with answer-only loss, and split."""
+    """Load an alpaca-format JSON dataset, tokenize with answer-only loss, and split."""
     with open(data_path) as f:
         raw = json.load(f)
     print(f"Loaded {len(raw)} examples from {data_path}")
+
+    dataset_name = os.path.basename(data_path)
 
     ds = Dataset.from_list(raw)
     if max_samples is not None and max_samples < len(ds):
         ds = ds.shuffle(seed=seed).select(range(max_samples))
 
     ds = ds.map(
-        lambda ex: tokenize_with_mask(ex, tokenizer, max_length),
+        lambda ex: tokenize_with_mask(ex, tokenizer, max_length, dataset_name),
         remove_columns=ds.column_names,
     )
 
@@ -145,7 +216,6 @@ def train_causal_lm(args):
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
-        overwrite_output_dir=True,
         num_train_epochs=args.num_epochs,
         per_device_train_batch_size=args.per_device_batch,
         per_device_eval_batch_size=2,
@@ -275,7 +345,6 @@ def train_classification(args):
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
-        overwrite_output_dir=True,
         num_train_epochs=args.num_epochs,
         per_device_train_batch_size=args.per_device_batch,
         per_device_eval_batch_size=64,

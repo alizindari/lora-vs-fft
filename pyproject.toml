@@ -9,7 +9,6 @@ dependencies = [
     "peft>=0.12.0,<0.19.0",
     "datasets>=2.20.0",
     "accelerate>=0.33.0",
-    "deepspeed>=0.14.0",
     "lm-eval>=0.4.0",
     "safetensors",
     "numpy",
@@ -21,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 flash = ["flash-attn>=2.5.0"]
 wandb = ["wandb"]
+multi_gpu = ["deepspeed>=0.14.0"]
 
 [build-system]
 requires = ["hatchling"]

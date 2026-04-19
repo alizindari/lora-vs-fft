@@ -9,16 +9,16 @@
 # CHANGE ONLY THESE
 #############################################
 
-# --- What to evaluate ---
-FT_TYPE="lora"                           # full | lora | base (base = no fine-tuning)
-BASE_MODEL="Qwen/Qwen2.5-3B"            # HF model name (required for lora and base)
-CHECKPOINT_PATH="saves/qwen2.5-3b/commonsense_170k_all/lora_r64_a128/adamw_lr2.0e-5_ep3.0_bs8_seed42/checkpoint-500"
+# --- What to evaluate (env-overridable: FT_TYPE=X BASE_MODEL=Y CHECKPOINT_PATH=Z sbatch ...) ---
+FT_TYPE="${FT_TYPE:-lora}"                           # full | lora | base (base = no fine-tuning)
+BASE_MODEL="${BASE_MODEL:-Qwen/Qwen2.5-3B}"          # HF model name (required for lora and base)
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-saves/qwen2.5-3b/commonsense_170k_all/lora_r64_a128/adamw_lr2.0e-5_ep3.0_bs8_seed42/checkpoint-500}"
                                          # path to fine-tuned checkpoint (ignored if base)
 
 # --- Task ---
 GLUE_TASK=""                             # sst2|cola|mrpc|stsb|qnli|rte|mnli (empty = Qwen lm-eval)
-TASKS="arc_easy,arc_challenge,boolq,commonsense_qa,piqa,winogrande,hellaswag,openbookqa"
-                                         # lm-eval benchmarks (ignored if GLUE_TASK is set)
+TASKS="${TASKS:-arc_easy,arc_challenge,boolq,commonsense_qa,piqa,winogrande,hellaswag,openbookqa}"
+                                         # lm-eval benchmarks; env-overridable (e.g. TASKS=boolq)
 
 # --- Eval settings ---
 BATCH_SIZE=8                             # eval batch size
@@ -30,6 +30,9 @@ NUM_FEWSHOT=0                            # few-shot examples for lm-eval (Qwen o
 
 set -euo pipefail
 
+# --- Ensure we run from the project root ---
+cd "$SLURM_SUBMIT_DIR"
+
 # --- Install UV if needed ---
 if ! command -v uv &> /dev/null; then
     echo "Installing UV..."
@@ -38,7 +41,16 @@ if ! command -v uv &> /dev/null; then
 fi
 
 # --- Sync dependencies ---
-echo "Syncing Python environment..."
+# uv-managed Python (dev headers for triton JIT), per-job venv on node-local
+# scratch (NFS is ~50x slower on small-file ops), unbuffered Python stdout.
+export UV_PYTHON_PREFERENCE=only-managed
+export UV_PYTHON=3.12
+VENV_SCRATCH="${TMPDIR:-/tmp}"
+VENV_DIR="${VENV_SCRATCH}/lora-venv-${SLURM_JOB_ID}"
+export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
+export PYTHONUNBUFFERED=1
+echo "Syncing Python environment into $VENV_DIR ..."
+rm -rf "$VENV_DIR"
 uv sync
 
 # --- Output path: save results inside checkpoint/run directory ---
@@ -52,7 +64,11 @@ fi
 LOG_DIR=$(dirname "$OUTPUT_JSON")
 
 # --- Move job log into the run directory on exit (success or failure) ---
-trap 'mkdir -p "$LOG_DIR" 2>/dev/null; mv "job-eval-${SLURM_JOB_ID}.out" "${LOG_DIR}/eval.log" 2>/dev/null || true' EXIT
+trap '
+    set +e
+    mkdir -p "$LOG_DIR" 2>/dev/null
+    mv "job-eval-${SLURM_JOB_ID}.out" "${LOG_DIR}/eval.log" 2>/dev/null
+' EXIT
 
 # --- Build command ---
 CMD="uv run python src/eval.py --batch_size $BATCH_SIZE --output_path $OUTPUT_JSON"

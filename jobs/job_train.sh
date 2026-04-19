@@ -11,26 +11,26 @@
 #############################################
 
 # --- Model & data ---
-MODEL_NAME="Qwen/Qwen2.5-0.5B"          # Qwen/Qwen2.5-{0.5B,1.5B,3B,7B} | roberta-{base,large}
+MODEL_NAME="${MODEL_NAME:-Qwen/Qwen2.5-0.5B}" # Qwen/Qwen2.5-{0.5B,1.5B,3B,7B} | roberta-{base,large}
 GLUE_TASK=""                             # sst2|cola|mrpc|stsb|qnli|rte|mnli (empty = Qwen causal LM)
-DATA_PATH="data/commonsense_170k.json"   # Qwen only (ignored if GLUE_TASK is set)
-MAX_SAMPLES="1000"                       # "" = use all samples
+DATA_PATH="${DATA_PATH:-data/commonsense_170k.json}"   # Qwen only; env-overridable (e.g. DATA_PATH=data/boolq_alpaca.json)
+MAX_SAMPLES="${MAX_SAMPLES:-1000}"       # "" = use all samples (override via env: MAX_SAMPLES=X sbatch ...)
 
-# --- Method ---
-FINETUNING_TYPE="lora"                   # full | lora
-LORA_RANK=1                              # rank of LoRA decomposition
-LORA_ALPHA=2                             # LoRA scaling factor (typically 2*rank)
+# --- Method (env-overridable) ---
+FINETUNING_TYPE="${FINETUNING_TYPE:-lora}"    # full | lora
+LORA_RANK="${LORA_RANK:-1}"                   # rank of LoRA decomposition
+LORA_ALPHA="${LORA_ALPHA:-$((LORA_RANK * 2))}" # LoRA scaling factor (default 2*rank)
 LORA_DROPOUT=0.0                         # dropout on LoRA layers
 LORA_TARGET="all-linear"                 # "all-linear" | comma-separated layer names
 
 # --- Training ---
 OPTIMIZER="adamw"                        # adamw | sgd
 NUM_EPOCHS=3.0                           # total training epochs
-LEARNING_RATE=2.0e-4                     # peak learning rate
+LEARNING_RATE="${LEARNING_RATE:-2.0e-4}" # peak learning rate (env-overridable)
 WEIGHT_DECAY=0.01                        # L2 regularization
 WARMUP_RATIO=0.02                        # fraction of steps for LR warmup
-PER_DEVICE_BATCH=8                       # batch size per GPU
-GRAD_ACCUM=4                             # gradient accumulation steps (effective_bs = batch * gpus * accum)
+PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-8}" # batch size per GPU
+GRAD_ACCUM="${GRAD_ACCUM:-4}"             # gradient accumulation steps (effective_bs = batch * gpus * accum)
 LR_SCHEDULER="cosine"                    # cosine | linear | constant
 MAX_GRAD_NORM=1.0                        # gradient clipping threshold
 SGD_MOMENTUM=0.9                         # only used if OPTIMIZER=sgd
@@ -42,9 +42,22 @@ SEED=$RANDOM                             # random: controls weight init & batch 
 
 # --- Logging & infrastructure ---
 LOGGING_STEPS=20
-EVAL_STEPS=50                            # Qwen only; RoBERTa evals every epoch
-SAVE_STEPS=50                            # Qwen only; RoBERTa saves every epoch
 NUM_GPUS=1                               # must match --gres gpu count above
+
+# EVAL_STEPS / SAVE_STEPS scale with dataset size so there are ~3 evals total
+# (roughly one per epoch) regardless of how many samples are in the run.
+# Overridable by env if you want more or fewer checkpoints.
+if [ -n "${MAX_SAMPLES:-}" ]; then
+    _train_size=$(( MAX_SAMPLES * 80 / 100 ))
+    _effective_bs=$(( PER_DEVICE_BATCH * NUM_GPUS * GRAD_ACCUM ))
+    _steps_per_epoch=$(( (_train_size + _effective_bs - 1) / _effective_bs ))
+    [ $_steps_per_epoch -lt 1 ] && _steps_per_epoch=1
+    EVAL_STEPS="${EVAL_STEPS:-$_steps_per_epoch}"
+    SAVE_STEPS="${SAVE_STEPS:-$_steps_per_epoch}"
+else
+    EVAL_STEPS="${EVAL_STEPS:-200}"
+    SAVE_STEPS="${SAVE_STEPS:-200}"
+fi
 
 # Reference configs:
 #   Qwen 0.5B LoRA: MODEL_NAME="Qwen/Qwen2.5-0.5B"  GLUE_TASK=""      LR=2e-4  EP=3   R=1   A=2   BS=8  GA=4
@@ -57,6 +70,9 @@ NUM_GPUS=1                               # must match --gres gpu count above
 
 set -euo pipefail
 
+# --- Ensure we run from the project root ---
+cd "$SLURM_SUBMIT_DIR"
+
 # --- Derive short model name: "Qwen/Qwen2.5-0.5B" -> "qwen2.5-0.5b", "roberta-base" -> "roberta-base" ---
 MODEL_SHORT=$(basename "$MODEL_NAME" | tr '[:upper:]' '[:lower:]')
 
@@ -67,9 +83,29 @@ if ! command -v uv &> /dev/null; then
     export PATH="$HOME/.local/bin:$PATH"
 fi
 
-# --- Sync dependencies ---
-echo "Syncing Python environment..."
-uv sync
+# --- Sync dependencies (recreate venv to avoid cross-node staleness on HPC) ---
+# Use uv-managed Python so dev headers (Python.h) are available (some compute
+# nodes' system Python lacks them, which breaks triton JIT if it ever runs).
+export UV_PYTHON_PREFERENCE=only-managed
+export UV_PYTHON=3.12
+# Per-job venv on node-local scratch. NFS destroys us on small-file ops:
+# some nodes take 30-50 min just to rm -rf the venv. Local /tmp is ~instant,
+# and uv sync is also faster because wheel installs don't hammer NFS.
+VENV_SCRATCH="${TMPDIR:-/tmp}"
+VENV_DIR="${VENV_SCRATCH}/lora-venv-${SLURM_JOB_ID}"
+export UV_PROJECT_ENVIRONMENT="$VENV_DIR"
+# Flush Python stdout line-by-line so tqdm/print show up in the log while
+# training runs (default is block-buffered when redirected to file).
+export PYTHONUNBUFFERED=1
+echo "Syncing Python environment into $VENV_DIR ..."
+rm -rf "$VENV_DIR"
+# deepspeed pulls in triton's eager-compiled ops; only install it when actually
+# needed for multi-GPU, so single-GPU runs don't require a C compiler on the node.
+if [ "$NUM_GPUS" -gt 1 ] && [ -z "$GLUE_TASK" ]; then
+    uv sync --extra multi_gpu
+else
+    uv sync
+fi
 
 # --- Build output directory ---
 # Format: saves/<model>/<task>/<method>/<optimizer>_lr<lr>_ep<epochs>_bs<bs>_seed<seed>
@@ -91,8 +127,13 @@ fi
 
 OUTPUT_DIR="saves/${MODEL_SHORT}/${TASK_DIR}/${METHOD_DIR}/${OPTIMIZER}_lr${LEARNING_RATE}_ep${NUM_EPOCHS}_bs${EFFECTIVE_BS}_seed${SEED}"
 
-# --- Move job log into the run directory on exit (success or failure) ---
-trap 'mkdir -p "$OUTPUT_DIR" 2>/dev/null; mv "job-train-${SLURM_JOB_ID}.out" "${OUTPUT_DIR}/train.log" 2>/dev/null || true' EXIT
+# --- Move job log into the run directory on exit (success or failure); clean venv ---
+trap '
+    set +e
+    mkdir -p "$OUTPUT_DIR" 2>/dev/null
+    mv "job-train-${SLURM_JOB_ID}.out" "${OUTPUT_DIR}/train.log" 2>/dev/null
+    rm -rf "$VENV_DIR" 2>/dev/null
+' EXIT
 
 # --- Build command ---
 CMD="uv run python src/train.py \
@@ -186,6 +227,13 @@ echo "Output:         $OUTPUT_DIR"
 echo "Data seed:      $DATA_SEED"
 echo "Train seed:     $SEED"
 echo "========================================"
+
+# --- Preflight checks ---
+if [ ! -f src/train.py ]; then
+    echo "ERROR: src/train.py not found in $PWD" >&2
+    echo "Submit this job from the project root: sbatch jobs/job_train.sh" >&2
+    exit 1
+fi
 
 # --- Run ---
 eval $CMD
