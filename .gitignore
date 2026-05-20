@@ -1,6 +1,7 @@
 .venv/
 saves/
 data/
+figures/
 __pycache__/
 *.pyc
 *.out
